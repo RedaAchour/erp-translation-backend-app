@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import pool from '../db';
-import { translateText, translateBatch } from '../services/claude';
+//import { translateText, translateBatch } from '../services/claude';
+import { translateText, translateBatch } from '../services/glm';
 
 const router = Router();
 
