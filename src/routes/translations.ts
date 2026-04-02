@@ -12,7 +12,7 @@ router.get('/translations', async (req: Request, res: Response) => {
   try {
     const {
       page = '1',
-      limit = '50',
+      limit = '10',
       status,
       context,
       search,
@@ -20,7 +20,7 @@ router.get('/translations', async (req: Request, res: Response) => {
     } = req.query;
 
     const offset = (parseInt(page as string) - 1) * parseInt(limit as string);
-    let whereClause = 'WHERE 1=1';
+    let whereClause = 'WHERE 1=1 AND link is null';
     const params: any[] = [];
     let paramCount = 1;
 
@@ -62,7 +62,7 @@ router.get('/translations', async (req: Request, res: Response) => {
     const query = `
       SELECT * FROM translations
       ${whereClause}
-      ORDER BY updated_at DESC
+      ORDER BY id
       LIMIT $${paramCount} OFFSET $${paramCount + 1}
     `;
 
@@ -202,6 +202,27 @@ router.post('/translations/ai-translate', async (req: Request, res: Response) =>
   } catch (error) {
     console.error('Error AI translating:', error);
     res.status(500).json({ error: 'Failed to generate translations' });
+  }
+});
+
+/**
+ * GET /api/translations/:id/:filename
+ * Fetch a single translation row by id and filename
+ */
+router.get('/translations/:id/:filename', async (req: Request, res: Response) => {
+  try {
+    const { id, filename } = req.params;
+    const query = 'SELECT * FROM translations WHERE id = $1 AND filename = $2';
+    const result = await pool.query(query, [id, filename]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Translation not found' });
+    }
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Error fetching single translation:', error);
+    res.status(500).json({ error: 'Failed to fetch translation' });
   }
 });
 
