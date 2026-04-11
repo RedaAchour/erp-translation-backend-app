@@ -83,3 +83,9 @@ temp/
 docker-compose.override.yml
 # ts-node cache
 .ts-node/
+
+# =========================
+# AI Translations
+# =========================
+public/output
+*.zip

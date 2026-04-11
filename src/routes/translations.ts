@@ -2,6 +2,8 @@ import { Router, Request, Response } from 'express';
 import pool from '../db';
 //import { translateText, translateBatch } from '../services/claude';
 import { translateText, translateBatch } from '../services/glm';
+import fs from 'fs/promises';
+import path from 'path';
 
 const router = Router();
 
@@ -359,6 +361,94 @@ router.post('/translations/bulk-validate', async (req: Request, res: Response) =
   } catch (error) {
     console.error('Error bulk validating:', error);
     res.status(500).json({ error: 'Failed to validate translations' });
+  }
+});
+/**
+ * POST /api/translations/generate-xml-files
+ * Generate XML files from get_xml() SQL function and save to public/output
+ */
+router.post('/translations/generate-xml-files', async (_req: Request, res: Response) => {
+  try {
+    const outputDir = path.join(process.cwd(), 'public', 'output');
+
+    // 1- clear/delete all "output" folder content
+    try {
+      await fs.rm(outputDir, { recursive: true, force: true });
+    } catch (err) {
+      // Ignore errors if directory doesn't exist
+    }
+
+    // Recreate the output folder
+    await fs.mkdir(outputDir, { recursive: true });
+
+    // Call get_xml() function
+    const query = 'SELECT * FROM get_xml()';
+    const result = await pool.query(query);
+
+    // Group rows by folder and file_name
+    const fileMap: Record<string, Record<string, string[]>> = {};
+    //let i: number = 0;
+    for (const row of result.rows) {
+      const { folder, file_name, xml } = row;
+
+      if (!folder || !file_name) continue;
+
+      if (!fileMap[folder]) {
+        fileMap[folder] = {};
+      }
+      if (!fileMap[folder][file_name]) {
+        fileMap[folder][file_name] = [];
+      }
+      if (xml) {
+        fileMap[folder][file_name].push(xml);
+      }
+      //i++;
+      //console.log(`${i} : ${folder} : ${file_name} : ${xml}`);
+    }
+
+    const xmlHeader = `<!-- edited with Code in ${new Date().getFullYear() + '-' + new Date().getMonth() + '-' + new Date().getDate() + ' ' + new Date().getHours() + ':' + new Date().getMinutes() + ':' + new Date().getSeconds()} by Silwane -->\n<?xml version="1.0" encoding="utf-8"?>\n<Root>\n`;
+    const xmlFooter = `\n</Root>\n`;
+
+    const writePromises = Object.entries(fileMap).flatMap(([folder, files]) => {
+      const folderPath = path.join(outputDir, folder);
+
+      // Ensure folder exists, then write its files
+      return (async () => {
+        await fs.mkdir(folderPath, { recursive: true });
+
+        const filePromises = Object.entries(files).map(async ([fileName, xmlLines]) => {
+          const filePath = path.join(folderPath, fileName);
+          // 4- ensure that these files are xml compliant with root tg as <Root>
+          // Joining the xml snippets and wrapping them in Root element
+          const content = xmlHeader + xmlLines.join('\n') + xmlFooter;
+          
+          let fileHandle;
+          try {
+            fileHandle = await fs.open(filePath, 'w');
+            await fileHandle.writeFile(content, 'utf-8');
+          } finally {
+            if (fileHandle !== undefined) {
+              await fileHandle.close();
+            }
+          }
+        });
+
+        await Promise.all(filePromises);
+      })();
+    });
+
+    await Promise.all(writePromises);
+
+    // Calculate total files generated
+    let totalFiles = 0;
+    for (const folder in fileMap) {
+      totalFiles += Object.keys(fileMap[folder]).length;
+    }
+
+    res.json({ success: true, message: 'XML files generated successfully', filesGenerated: totalFiles });
+  } catch (error) {
+    console.error('Error generating XML files:', error);
+    res.status(500).json({ error: 'Failed to generate XML files' });
   }
 });
 
