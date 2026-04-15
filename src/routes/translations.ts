@@ -406,8 +406,8 @@ router.post('/translations/generate-xml-files', async (_req: Request, res: Respo
       //console.log(`${i} : ${folder} : ${file_name} : ${xml}`);
     }
 
-    const xmlHeader = `<!-- edited with Code in ${new Date().getFullYear() + '-' + new Date().getMonth() + '-' + new Date().getDate() + ' ' + new Date().getHours() + ':' + new Date().getMinutes() + ':' + new Date().getSeconds()} by Silwane -->\n<?xml version="1.0" encoding="utf-8"?>\n<Root>\n`;
-    const xmlFooter = `\n</Root>\n`;
+    const xmlHeader = `<?xml version="1.0" encoding="utf-8"?>\n<Root>\n`;
+    const xmlFooter = `\n</Root>`;
 
     const writePromises = Object.entries(fileMap).flatMap(([folder, files]) => {
       const folderPath = path.join(outputDir, folder);
@@ -421,7 +421,7 @@ router.post('/translations/generate-xml-files', async (_req: Request, res: Respo
           // 4- ensure that these files are xml compliant with root tg as <Root>
           // Joining the xml snippets and wrapping them in Root element
           const content = xmlHeader + xmlLines.join('\n') + xmlFooter;
-          
+
           let fileHandle;
           try {
             fileHandle = await fs.open(filePath, 'w');
@@ -449,6 +449,78 @@ router.post('/translations/generate-xml-files', async (_req: Request, res: Respo
   } catch (error) {
     console.error('Error generating XML files:', error);
     res.status(500).json({ error: 'Failed to generate XML files' });
+  }
+});
+/**
+ * POST /api/translations/translation
+ * Add a new entry to the translations table
+ */
+router.post('/translations/translation', async (req: Request, res: Response) => {
+  try {
+    let {
+      filename,
+      id,
+      fr,
+      en,
+      es,
+      ar,
+      link,
+      context,
+      en_validated = false,
+      es_validated = false,
+      ar_validated = false
+    } = req.body;
+
+    // Validation
+    if (!id || !filename) {
+      return res.status(400).json({ error: 'id and filename are required' });
+    }
+
+    if (!fr && !link) {
+      return res.status(400).json({ error: 'Either fr or link must be provided' });
+    }
+
+    en_validated = Boolean(en_validated);
+    es_validated = Boolean(es_validated);
+    ar_validated = Boolean(ar_validated);
+
+    if (!ar && ar_validated) {
+      return res.status(400).json({ error: 'Cannot set ar_validated to true if ar is empty' });
+    }
+
+    if (!es && es_validated) {
+      return res.status(400).json({ error: 'Cannot set es_validated to true if es is empty' });
+    }
+
+    if (!en && en_validated) {
+      return res.status(400).json({ error: 'Cannot set en_validated to true if en is empty' });
+    }
+
+    const query = `
+      INSERT INTO translations (
+        filename, id, fr, en, es, ar, link, context,
+        en_validated, es_validated, ar_validated
+      )
+      VALUES (
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
+      )
+      RETURNING *
+    `;
+
+    const params = [
+      filename, id, fr, en, es, ar, link, context,
+      en_validated, es_validated, ar_validated
+    ];
+
+    const result = await pool.query(query, params);
+
+    res.status(201).json(result.rows[0]);
+  } catch (error: any) {
+    console.error('Error creating translation:', error);
+    if (error.code === '23505') { // unique violation
+      return res.status(409).json({ error: 'Translation with this id and filename already exists' });
+    }
+    res.status(500).json({ error: 'Failed to create translation' });
   }
 });
 
