@@ -24,6 +24,10 @@ router.get('/translations', async (req: Request, res: Response) => {
       context,
       search,
       validated,
+      fr_filter,
+      en_filter,
+      ar_filter,
+      es_filter,
     } = req.query;
 
     const offset = (parseInt(page as string) - 1) * parseInt(limit as string);
@@ -57,6 +61,22 @@ router.get('/translations', async (req: Request, res: Response) => {
       whereClause += ` AND en_validated = true AND ar_validated = true AND es_validated = true`;
     } else if (validated === 'false') {
       whereClause += ` AND (en_validated = false OR ar_validated = false OR es_validated = false)`;
+    }
+
+    // Filter by language column empty/non-empty
+    const langFilters = [
+      { param: fr_filter, column: 'fr' },
+      { param: en_filter, column: 'en' },
+      { param: ar_filter, column: 'ar' },
+      { param: es_filter, column: 'es' },
+    ];
+
+    for (const lf of langFilters) {
+      if (lf.param === 'empty') {
+        whereClause += ` AND (${lf.column} IS NULL OR ${lf.column} = '')`;
+      } else if (lf.param === 'not_empty') {
+        whereClause += ` AND ${lf.column} IS NOT NULL AND ${lf.column} != ''`;
+      }
     }
 
     // Get total count
@@ -241,6 +261,7 @@ router.put('/translations/:id/:filename', async (req: Request, res: Response) =>
   try {
     const { id, filename } = req.params;
     const {
+      fr,
       en,
       ar,
       es,
@@ -256,6 +277,11 @@ router.put('/translations/:id/:filename', async (req: Request, res: Response) =>
     const params: any[] = [];
     let paramCount = 1;
 
+    if (fr !== undefined) {
+      updates.push(`fr = $${paramCount}`);
+      params.push(fr);
+      paramCount++;
+    }
     if (en !== undefined) {
       updates.push(`en = $${paramCount}`);
       params.push(en);
@@ -631,9 +657,9 @@ router.post('/import', upload.array('files'), async (req: Request, res: Response
 /**
  * Upsert a single translation entry during import.
  *
- * - New row → INSERT normally.
- * - Existing row with link → update link if changed.
- * - Existing row with language value → only update if the column is currently NULL.
+ * - New row -> INSERT normally.
+ * - Existing row with link -> update link if changed.
+ * - Existing row with language value -> only update if the column is currently NULL.
  *
  * Returns 'inserted', 'updated', or 'skipped'.
  */

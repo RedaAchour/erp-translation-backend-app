@@ -88,4 +88,5 @@ docker-compose.override.yml
 # AI Translations
 # =========================
 public/output
+public/input
 *.zip
