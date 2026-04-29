@@ -4,6 +4,10 @@ import pool from '../db';
 import { translateText, translateBatch } from '../services/glm';
 import fs from 'fs/promises';
 import path from 'path';
+import multer from 'multer';
+import { parseXmlContent, LangCode, RawEntry } from '../parsers/xmlParser';
+
+const upload = multer({ storage: multer.memoryStorage() });
 
 const router = Router();
 
@@ -523,5 +527,158 @@ router.post('/translations/translation', async (req: Request, res: Response) => 
     res.status(500).json({ error: 'Failed to create translation' });
   }
 });
+
+/**
+ * POST /api/import
+ * Import XML translation files (same logic as erp-i18n-export).
+ * Accepts multipart form data with:
+ *   - lang: language code ('fr' | 'en' | 'ar' | 'es')
+ *   - files: one or more .xml files
+ *
+ * Upsert rule: if (id, filename) already exists, only update the
+ * language column if it is currently NULL (never overwrite existing translations).
+ */
+router.post('/import', upload.array('files'), async (req: Request, res: Response) => {
+  try {
+    const { lang } = req.body;
+    const allowedLangs: LangCode[] = ['fr', 'en', 'ar', 'es'];
+
+    if (!lang || !allowedLangs.includes(lang as LangCode)) {
+      return res.status(400).json({
+        error: `lang is required and must be one of: ${allowedLangs.join(', ')}`,
+      });
+    }
+
+    const files = req.files as Express.Multer.File[] | undefined;
+    if (!files || files.length === 0) {
+      return res.status(400).json({ error: 'At least one XML file is required' });
+    }
+
+    const langCode = lang as LangCode;
+    let totalInserted = 0;
+    let totalUpdated = 0;
+    let totalSkipped = 0;
+    const fileResults: { filename: string; entries: number; inserted: number; updated: number; skipped: number }[] = [];
+
+    for (const file of files) {
+      // Derive filename without extension (matches erp-i18n-export behaviour)
+      const filename = path.parse(file.originalname).name;
+      if (!filename || filename.trim() === '') {
+        continue;
+      }
+
+      const content = file.buffer.toString('utf-8');
+
+      let parsed;
+      try {
+        parsed = parseXmlContent(content, langCode, filename);
+      } catch (err: any) {
+        console.error(`Failed to parse XML file: ${file.originalname}. Error: ${err.message}`);
+        fileResults.push({ filename: file.originalname, entries: 0, inserted: 0, updated: 0, skipped: 0 });
+        continue;
+      }
+
+      let fileInserted = 0;
+      let fileUpdated = 0;
+      let fileSkipped = 0;
+
+      for (const entry of parsed.entries) {
+        try {
+          const result = await upsertTranslationImport(
+            entry.id,
+            entry.link ? null : langCode,
+            entry.value ?? null,
+            filename,
+            entry.link ?? null
+          );
+          if (result === 'inserted') fileInserted++;
+          else if (result === 'updated') fileUpdated++;
+          else fileSkipped++;
+        } catch (err: any) {
+          console.error(`Failed to upsert entry: ${filename} ${entry.id} (${langCode}). Error: ${err.message}`);
+          fileSkipped++;
+        }
+      }
+
+      totalInserted += fileInserted;
+      totalUpdated += fileUpdated;
+      totalSkipped += fileSkipped;
+
+      fileResults.push({
+        filename,
+        entries: parsed.entries.length,
+        inserted: fileInserted,
+        updated: fileUpdated,
+        skipped: fileSkipped,
+      });
+    }
+
+    res.json({
+      success: true,
+      lang: langCode,
+      filesProcessed: fileResults.length,
+      totalInserted,
+      totalUpdated,
+      totalSkipped,
+      files: fileResults,
+    });
+  } catch (error) {
+    console.error('Error importing translations:', error);
+    res.status(500).json({ error: 'Failed to import translations' });
+  }
+});
+
+/**
+ * Upsert a single translation entry during import.
+ *
+ * - New row → INSERT normally.
+ * - Existing row with link → update link if changed.
+ * - Existing row with language value → only update if the column is currently NULL.
+ *
+ * Returns 'inserted', 'updated', or 'skipped'.
+ */
+async function upsertTranslationImport(
+  id: string,
+  lang: LangCode | null,
+  value: string | null,
+  filename: string,
+  link: string | null
+): Promise<'inserted' | 'updated' | 'skipped'> {
+  if (link !== null) {
+    // Link entry: insert or update link
+    const result = await pool.query(
+      `INSERT INTO translations (id, link, filename)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (id, filename) DO UPDATE SET
+         link = EXCLUDED.link,
+         updated_at = NOW()
+       WHERE EXCLUDED.link IS DISTINCT FROM translations.link
+       RETURNING (xmax = 0) AS is_insert`,
+      [id, link, filename]
+    );
+    if (result.rowCount === 0) return 'skipped';
+    return result.rows[0].is_insert ? 'inserted' : 'updated';
+  }
+
+  // Language value entry: only update if the existing column is NULL
+  const allowedLangs: LangCode[] = ['fr', 'en', 'ar', 'es'];
+  if (!lang || !allowedLangs.includes(lang)) {
+    throw new Error(`Invalid language code: ${lang}`);
+  }
+
+  const result = await pool.query(
+    `INSERT INTO translations (id, ${lang}, filename)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (id, filename) DO UPDATE SET
+       ${lang} = EXCLUDED.${lang},
+       updated_at = NOW()
+     WHERE translations.${lang} IS NULL AND EXCLUDED.${lang} IS NOT NULL
+     RETURNING (xmax = 0) AS is_insert`,
+    [id, value, filename]
+  );
+
+  if (result.rowCount === 0) return 'skipped';
+  return result.rows[0].is_insert ? 'inserted' : 'updated';
+}
 
 export default router;
