@@ -2,6 +2,8 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import translationsRouter from './routes/translations';
+import authRouter from './routes/auth';
+import { authenticateToken } from './middleware/auth';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -15,8 +17,11 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// API routes
-app.use('/api', translationsRouter);
+// Public routes
+app.use('/auth', authRouter);
+
+// Protected routes
+app.use('/api', authenticateToken, translationsRouter);
 
 // Start server
 app.listen(PORT, () => {
