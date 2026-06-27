@@ -1,5 +1,7 @@
-import { Router, Request, Response } from 'express';
+import { Router, Response } from 'express';
+import { PoolClient } from 'pg';
 import pool from '../db';
+import { AuthRequest } from '../middleware/auth';
 //import { translateText, translateBatch } from '../services/claude';
 import { translateText, translateBatch } from '../services/glm';
 import fs from 'fs/promises';
@@ -11,11 +13,23 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 const router = Router();
 
+const SORTABLE_COLUMNS = new Set(['id', 'filename', 'fr', 'en', 'ar', 'es', 'status', 'context', 'created_at', 'updated_at']);
+
+/** Set transaction-scoped session variables for the audit trigger. */
+async function setAuditContext(
+  client: PoolClient,
+  username: string,
+  changeType: 'human_edited' | 'ai_generated' | 'bulk_import'
+): Promise<void> {
+  await client.query('SELECT set_config($1, $2, true)', ['app.current_user', username]);
+  await client.query('SELECT set_config($1, $2, true)', ['app.change_type', changeType]);
+}
+
 /**
  * GET /api/translations
  * Fetch translations with filters and pagination
  */
-router.get('/translations', async (req: Request, res: Response) => {
+router.get('/translations', async (req: AuthRequest, res: Response) => {
   try {
     const {
       page = '1',
@@ -28,6 +42,8 @@ router.get('/translations', async (req: Request, res: Response) => {
       en_filter,
       ar_filter,
       es_filter,
+      sortBy,
+      sortOrder,
     } = req.query;
 
     const offset = (parseInt(page as string) - 1) * parseInt(limit as string);
@@ -79,6 +95,9 @@ router.get('/translations', async (req: Request, res: Response) => {
       }
     }
 
+    const resolvedSortBy = typeof sortBy === 'string' && SORTABLE_COLUMNS.has(sortBy) ? sortBy : 'id';
+    const resolvedSortOrder: 'ASC' | 'DESC' = typeof sortOrder === 'string' && sortOrder.toUpperCase() === 'DESC' ? 'DESC' : 'ASC';
+
     // Get total count
     const countQuery = `SELECT COUNT(*) FROM translations ${whereClause}`;
     const countResult = await pool.query(countQuery, params);
@@ -89,7 +108,7 @@ router.get('/translations', async (req: Request, res: Response) => {
     const query = `
       SELECT * FROM translations
       ${whereClause}
-      ORDER BY id
+      ORDER BY ${resolvedSortBy} ${resolvedSortOrder} NULLS LAST
       LIMIT $${paramCount} OFFSET $${paramCount + 1}
     `;
 
@@ -114,7 +133,7 @@ router.get('/translations', async (req: Request, res: Response) => {
  * GET /api/translations/stats
  * Get overall statistics
  */
-router.get('/translations/stats', async (_req: Request, res: Response) => {
+router.get('/translations/stats', async (_req: AuthRequest, res: Response) => {
   try {
     const query = `
       SELECT
@@ -141,7 +160,7 @@ router.get('/translations/stats', async (_req: Request, res: Response) => {
  * GET /api/translations/contexts
  * Get all unique contexts
  */
-router.get('/translations/contexts', async (_req: Request, res: Response) => {
+router.get('/translations/contexts', async (_req: AuthRequest, res: Response) => {
   try {
     const query = `
       SELECT DISTINCT context
@@ -162,7 +181,8 @@ router.get('/translations/contexts', async (_req: Request, res: Response) => {
  * POST /api/translations/ai-translate
  * Generate AI translations for selected items
  */
-router.post('/translations/ai-translate', async (req: Request, res: Response) => {
+router.post('/translations/ai-translate', async (req: AuthRequest, res: Response) => {
+  const client = await pool.connect();
   try {
     const { ids, filenames } = req.body;
 
@@ -181,20 +201,17 @@ router.post('/translations/ai-translate', async (req: Request, res: Response) =>
       params.push(id, filenames[i]);
     });
 
-    const query = `
-      SELECT id, filename, fr, context
-      FROM translations
-      WHERE (id, filename) IN (${placeholders})
-    `;
-
-    const result = await pool.query(query, params);
+    const fetchResult = await client.query(
+      `SELECT id, filename, fr, context FROM translations WHERE (id, filename) IN (${placeholders})`,
+      params
+    );
 
     // Translate in batches of 20
     const batchSize = 20;
     const translations: any[] = [];
 
-    for (let i = 0; i < result.rows.length; i += batchSize) {
-      const batch = result.rows.slice(i, i + batchSize);
+    for (let i = 0; i < fetchResult.rows.length; i += batchSize) {
+      const batch = fetchResult.rows.slice(i, i + batchSize);
       const batchResults = await translateBatch(
         batch.map((row) => ({
           french: row.fr,
@@ -203,32 +220,34 @@ router.post('/translations/ai-translate', async (req: Request, res: Response) =>
         }))
       );
 
-      // Update database
+      // Update database in a single transaction per batch
+      await client.query('BEGIN');
+      await setAuditContext(client, 'ai', 'ai_generated');
+
       for (let j = 0; j < batch.length; j++) {
         const row = batch[j];
         const translation = batchResults[j];
 
-        await pool.query(
-          `
-          UPDATE translations
-          SET en = $1, ar = $2, es = $3, status = 'ai_translated'
-          WHERE id = $4 AND filename = $5
-        `,
+        await client.query(
+          `UPDATE translations
+           SET en = $1, ar = $2, es = $3, status = 'ai_translated'
+           WHERE id = $4 AND filename = $5`,
           [translation.english, translation.arabic, translation.spanish, row.id, row.filename]
         );
 
-        translations.push({
-          id: row.id,
-          filename: row.filename,
-          ...translation,
-        });
+        translations.push({ id: row.id, filename: row.filename, ...translation });
       }
+
+      await client.query('COMMIT');
     }
 
     res.json({ success: true, count: translations.length, translations });
   } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
     console.error('Error AI translating:', error);
     res.status(500).json({ error: 'Failed to generate translations' });
+  } finally {
+    client.release();
   }
 });
 
@@ -236,7 +255,7 @@ router.post('/translations/ai-translate', async (req: Request, res: Response) =>
  * GET /api/translations/:id/:filename
  * Fetch a single translation row by id and filename
  */
-router.get('/translations/:id/:filename', async (req: Request, res: Response) => {
+router.get('/translations/:id/:filename', async (req: AuthRequest, res: Response) => {
   try {
     const { id, filename } = req.params;
     const query = 'SELECT * FROM translations WHERE id = $1 AND filename = $2';
@@ -254,10 +273,32 @@ router.get('/translations/:id/:filename', async (req: Request, res: Response) =>
 });
 
 /**
+ * GET /api/translations/:id/:filename/history
+ * Fetch the change history for a single translation entry
+ */
+router.get('/translations/:id/:filename/history', async (req: AuthRequest, res: Response) => {
+  try {
+    const { id, filename } = req.params;
+    const result = await pool.query(
+      `SELECT id, language, old_value, new_value, changed_by, change_type, changed_at
+       FROM translation_history
+       WHERE translation_id = $1 AND filename = $2
+       ORDER BY changed_at DESC`,
+      [id, filename]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching translation history:', error);
+    res.status(500).json({ error: 'Failed to fetch translation history' });
+  }
+});
+
+/**
  * PUT /api/translations/:id/:filename
  * Update a single translation
  */
-router.put('/translations/:id/:filename', async (req: Request, res: Response) => {
+router.put('/translations/:id/:filename', async (req: AuthRequest, res: Response) => {
+  const client = await pool.connect();
   try {
     const { id, filename } = req.params;
     const {
@@ -332,6 +373,9 @@ router.put('/translations/:id/:filename', async (req: Request, res: Response) =>
       return res.status(400).json({ error: 'No fields to update' });
     }
 
+    await client.query('BEGIN');
+    await setAuditContext(client, req.username ?? 'unknown', 'human_edited');
+
     params.push(id, filename);
     const query = `
       UPDATE translations
@@ -340,7 +384,8 @@ router.put('/translations/:id/:filename', async (req: Request, res: Response) =>
       RETURNING *
     `;
 
-    const result = await pool.query(query, params);
+    const result = await client.query(query, params);
+    await client.query('COMMIT');
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Translation not found' });
@@ -348,8 +393,11 @@ router.put('/translations/:id/:filename', async (req: Request, res: Response) =>
 
     res.json(result.rows[0]);
   } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
     console.error('Error updating translation:', error);
     res.status(500).json({ error: 'Failed to update translation' });
+  } finally {
+    client.release();
   }
 });
 
@@ -357,7 +405,7 @@ router.put('/translations/:id/:filename', async (req: Request, res: Response) =>
  * POST /api/translations/bulk-validate
  * Bulk validate translations
  */
-router.post('/translations/bulk-validate', async (req: Request, res: Response) => {
+router.post('/translations/bulk-validate', async (req: AuthRequest, res: Response) => {
   try {
     const { ids, filenames, languages } = req.body;
 
@@ -381,11 +429,11 @@ router.post('/translations/bulk-validate', async (req: Request, res: Response) =
 
     const query = `
       UPDATE translations
-      SET ${setClause}, status = 'approved', validated_at = now()
+      SET ${setClause}, status = 'approved', validated_by = $${ids.length * 2 + 1}, validated_at = now()
       WHERE (id, filename) IN (${placeholders})
     `;
 
-    await pool.query(query, params);
+    await pool.query(query, [...params, req.username ?? 'unknown']);
 
     res.json({ success: true, count: ids.length });
   } catch (error) {
@@ -397,7 +445,7 @@ router.post('/translations/bulk-validate', async (req: Request, res: Response) =
  * POST /api/translations/generate-xml-files
  * Generate XML files from get_xml() SQL function and save to public/output
  */
-router.post('/translations/generate-xml-files', async (_req: Request, res: Response) => {
+router.post('/translations/generate-xml-files', async (_req: AuthRequest, res: Response) => {
   try {
     const outputDir = path.join(process.cwd(), 'public', 'output');
 
@@ -485,7 +533,7 @@ router.post('/translations/generate-xml-files', async (_req: Request, res: Respo
  * POST /api/translations/translation
  * Add a new entry to the translations table
  */
-router.post('/translations/translation', async (req: Request, res: Response) => {
+router.post('/translations/translation', async (req: AuthRequest, res: Response) => {
   try {
     let {
       filename,
@@ -564,7 +612,8 @@ router.post('/translations/translation', async (req: Request, res: Response) => 
  * Upsert rule: if (id, filename) already exists, only update the
  * language column if it is currently NULL (never overwrite existing translations).
  */
-router.post('/import', upload.array('files'), async (req: Request, res: Response) => {
+router.post('/import', upload.array('files'), async (req: AuthRequest, res: Response) => {
+  const client = await pool.connect();
   try {
     const { lang } = req.body;
     const allowedLangs: LangCode[] = ['fr', 'en', 'ar', 'es'];
@@ -611,6 +660,8 @@ router.post('/import', upload.array('files'), async (req: Request, res: Response
       for (const entry of parsed.entries) {
         try {
           const result = await upsertTranslationImport(
+            client,
+            req.username ?? 'import',
             entry.id,
             entry.link ? null : langCode,
             entry.value ?? null,
@@ -651,6 +702,8 @@ router.post('/import', upload.array('files'), async (req: Request, res: Response
   } catch (error) {
     console.error('Error importing translations:', error);
     res.status(500).json({ error: 'Failed to import translations' });
+  } finally {
+    client.release();
   }
 });
 
@@ -664,6 +717,8 @@ router.post('/import', upload.array('files'), async (req: Request, res: Response
  * Returns 'inserted', 'updated', or 'skipped'.
  */
 async function upsertTranslationImport(
+  client: PoolClient,
+  actor: string,
   id: string,
   lang: LangCode | null,
   value: string | null,
@@ -671,8 +726,8 @@ async function upsertTranslationImport(
   link: string | null
 ): Promise<'inserted' | 'updated' | 'skipped'> {
   if (link !== null) {
-    // Link entry: insert or update link
-    const result = await pool.query(
+    // Link entry: insert or update link — no audit needed for link changes
+    const result = await client.query(
       `INSERT INTO translations (id, link, filename)
        VALUES ($1, $2, $3)
        ON CONFLICT (id, filename) DO UPDATE SET
@@ -692,7 +747,10 @@ async function upsertTranslationImport(
     throw new Error(`Invalid language code: ${lang}`);
   }
 
-  const result = await pool.query(
+  await client.query('BEGIN');
+  await setAuditContext(client, actor, 'bulk_import');
+
+  const result = await client.query(
     `INSERT INTO translations (id, ${lang}, filename)
      VALUES ($1, $2, $3)
      ON CONFLICT (id, filename) DO UPDATE SET
@@ -702,6 +760,8 @@ async function upsertTranslationImport(
      RETURNING (xmax = 0) AS is_insert`,
     [id, value, filename]
   );
+
+  await client.query('COMMIT');
 
   if (result.rowCount === 0) return 'skipped';
   return result.rows[0].is_insert ? 'inserted' : 'updated';
